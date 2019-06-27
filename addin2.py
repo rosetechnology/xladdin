@@ -22,8 +22,14 @@ rose = Rose()
 rose.base_url = 'https://rose.ai'
 rose_username = os.environ['ROSE_USERNAME']
 rose_password = os.environ['ROSE_PASSWORD']
-bbg_username = os.environ['BBG_USERNAME']
-bbg_password = os.environ['BBG_PASSWORD']
+
+try:
+    bbg_username = os.environ['BBG_USERNAME']
+    bbg_password = os.environ['BBG_PASSWORD']
+    rose.login(bbg_username, bbg_password)
+    bbg_connected = True
+except:
+    bbg_connected = False
 
 try:
     rose.login(rose_username, rose_password)
@@ -549,6 +555,9 @@ def push_bbg_to_rose(args):
         win32api.MessageBox(xw.Book.caller().app.hwnd, "Success")
 
 def push_bbg_to_rose_sub(tickers, rose_codes=[], field='PX_LAST', start_date=datetime.datetime(1960, 1, 1), freq='DAILY'):
+    if not bbg_connected:
+        return(['Bloomburg not connected. Make sure you have bbg Rose account info in environmental variables'])
+    
     try:
         from rose_wrapper.bbg import simpleHistoryRequest, simpleReferenceDataRequest
     except:
