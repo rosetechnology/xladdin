@@ -1,5 +1,5 @@
 # Comment by Neville
-python_addin_version = '0.0.6'
+python_addin_version = '0.0.8'
 import xlwings as xw
 import win32api
 import requests
@@ -37,7 +37,7 @@ try:
 except requests.ConnectionError:
     connected = False
 
-debug = 1
+debug = 0
 
 invalid_excel_values = ['', 'None', '#N/A', -2146826281, -2146826245, -2146826246, -2146826259, -2146826288, -2146826252, -2146826265, -2146826273]
 invalid_excel_values_str = [str(c) for c in invalid_excel_values]
@@ -203,7 +203,7 @@ def push(args):
     file_saved =  "\\" in file_location or "/" in file_location
 
     if active_column < 2:
-        return
+        return win32api.MessageBox(xw.Book.caller().app.hwnd, "Error: Invalid data structure")
 
     try:
         errors = None
@@ -293,8 +293,10 @@ def push_map(args):
     code = args[0]
     map_range = args[1]
     meta_range = args[2]
+    file_location = args[3]
+    file_saved =  "\\" in file_location or "/" in file_location
     if meta_range == '0':
-        metas_df = pd.DataFrame(columns=['tag', 'attribute'])
+        metas_df = pd.DataFrame(columns=['tag', 'value'])
         metas_df.set_index('tag', inplace=True)
     else:
         metas_df = xw.Range(meta_range).options(pd.DataFrame,header = False, index = True).value.reset_index()
@@ -307,12 +309,17 @@ def push_map(args):
     rose_map = xw.Range(map_range).options(pd.DataFrame).value.reset_index()
     rose_map.columns = rose_map.columns.get_level_values(0)
 
-    rose_map = rose_map.where((pd.notnull(rose_map)), None)
+    try:
+        rose_map = rose_map.where((pd.notnull(rose_map)), None)
+    except:
+        win32api.MessageBox(xw.Book.caller().app.hwnd,'Error: column names are not unique')
+        return
     rose_map.columns = rose_map.columns.astype(str)
 
+    errors = []
     for column in rose_map.columns:
         for index in rose_map[column].index:
-            if type(rose_map.loc[index, column]) == datetime.datetime:
+            if type(rose_map.loc[index, column]) in [datetime.datetime, pd.Timestamp]:
                 rose_map.loc[index, column] = str(rose_map.loc[index, column])
             if isinstance(rose_map.loc[index, column], Decimal):
                 rose_map.loc[index, column] = float(rose_map.loc[index, column])
@@ -321,11 +328,19 @@ def push_map(args):
                 if str(rose_map.loc[index, column]) in invalid_excel_values_str:
                     rose_map.loc[index, column] = ''
             except:
-                win32api.MessageBox(xw.Book.caller().app.hwnd, "Error reading value " + str(rose_map.loc[index, column]) + " in column " + str(column) + ": Check to make sure that the column doesn't contain null values and all the rows in the column have the same data type.")
-                break
+                rose_map.loc[index, column] = ''
+                errors.append("Invalid value in row " + str(index) + ", column " + str(column))
+
+    if file_location is not None:
+        metas_df.loc['file_location', 'value'] = file_location
     try:
-        rose.push(code=code,  metas=metas_df, values=rose_map, data_type='map')
-        win32api.MessageBox(xw.Book.caller().app.hwnd, "Success")
+        rose.push(code=code, metas=metas_df, values=rose_map, data_type='map')
+
+        if len(errors) > 0:
+            win32api.MessageBox(xw.Book.caller().app.hwnd, "Success, but some invalid values in the map are changed to blank\n" + "\n".join(errors))
+        else:
+            win32api.MessageBox(xw.Book.caller().app.hwnd, str("Success") if file_saved else "Success, but file_location is not stored in metadata because your excel file is not saved")
+
     except:
         win32api.MessageBox(xw.Book.caller().app.hwnd, str(traceback.format_exc()) if debug == 1 else "Unknown error occured")
 
@@ -354,6 +369,7 @@ def pull_logic(args):
                 rose_code_json = rose.pull_logic(rose_code)
                 rose_code_logic_df.loc[rose_code, 'logic'] = rose_code_json['logic']
             except requests.exceptions.RequestException as e:
+                rose_code_logic_df.loc[rose_code, 'logic'] = ''
                 errors.append("Error (" + rose_code + "): " + (str(traceback.format_exc()) if debug == 1 else str(e.response.json()['message'])))
 
     if rose_code_as_range:
@@ -422,6 +438,8 @@ def push_logic(args):
                     rose.push_logic(code=rose_codes[idx], logic=haver_code)
                 except requests.exceptions.RequestException as e:
                     errors.append("Error (" + rose_codes[idx] + "): " + (str(traceback.format_exc()) if debug == 1 else str(e.response.json()['message'])))
+            elif any(word.lower() in [b.lower() for b in bblist] for word in rose_code.split('.')):
+                errors.append("Could not determine the source of the logic you would like to push to Rose. Please check if you switched Rose code and Bloomberg ticker")
             else:
                 errors.append("Error (" + rose_codes[idx] + "): " + (str(traceback.format_exc()) if debug == 1 else "Could not determine the source of the logic you would like to push to Rose. Currently, Rose can detect Bloomberg Tickers or Haver IDs"))
 
@@ -485,6 +503,12 @@ def update(args):
                         exit_code = subprocess.call(command_to_run, shell=True, cwd=os.path.dirname(os.path.realpath(__file__)))
                         if exit_code > 0:
                             raise Exception(exit_code)
+
+                    elif dataset['actor'].lower() == 'refinitiv':
+                        ticker = dataset['metas']['TICKER'] if 'TICKER' in dataset['metas'] else dataset['code']
+                        errors = push_refinitiv_to_rose_sub([ticker])
+                        if len(errors) > 0:
+                            raise Exception("Unknown error")
                     else:
                         raise Exception('Code cannot be auto-updated')
                 except:
@@ -556,8 +580,7 @@ def push_bbg_to_rose(args):
 
 def push_bbg_to_rose_sub(tickers, rose_codes=[], field='PX_LAST', start_date=datetime.datetime(1960, 1, 1), freq='DAILY'):
     if not bbg_connected:
-        return(['Bloomburg not connected. Make sure you have bbg Rose account info in environmental variables'])
-    
+        return ['Bloomburg not connected. Make sure you have bbg Rose account info in environmental variables']
     try:
         from rose_wrapper.bbg import simpleHistoryRequest, simpleReferenceDataRequest
     except:
@@ -607,122 +630,5 @@ def push_bbg_to_rose_sub(tickers, rose_codes=[], field='PX_LAST', start_date=dat
                 rose.push_logic(code=rose_codes[idx], logic=logic)
             except Exception as e:
                 errors.append("Unknown Error Generating Rose Code (" + rose_codes[idx] + "): " + str(traceback.format_exc()) if debug == 1 else ticker)
-
-    return errors
-
-def push_yahoo_to_rose(args):
-    try:
-        import yfinance as yf
-    except:
-        win32api.MessageBox(xw.Book.caller().app.hwnd,"fix yahoo finance not installed, run 'pip install yfinance --upgrade --no-cache-dir'")
-        return
-    tickerList = args[0]
-    tickerList_as_range = bool(int(args[1]))
-    rosecodeList = args[2]
-    rosecodeList_as_range = bool(int(args[3]))
-    field = args[4].title()
-
-    tickers = tickerList
-    rosecodes = rosecodeList
-    if tickerList_as_range:
-        tickers = [str(cell.value) for cell in xw.Range(tickerList)]
-    else:
-        tickers = [tickerList]
-    if rosecodeList_as_range:
-        rosecodes = [str(cell.value) for cell in xw.Range(rosecodeList)]
-    else:
-        rosecodes = [rosecodeList]
-    errors = push_yahoo_to_rose_sub(tickers, rosecodes,field)
-    if len(errors) > 0:
-        win32api.MessageBox(xw.Book.caller().app.hwnd, "Errors for the following codes:\n" + "\n".join(errors))
-    else:
-        win32api.MessageBox(xw.Book.caller().app.hwnd, "Success")
-
-def push_yahoo_to_rose_sub(tickers, rosecodes,field="Close"):
-    import yfinance as yf
-
-    rosecodes_exist= True
-    if len(rosecodes) == 0 or (len(rosecodes) == 1 and rosecodes[0] == ""):
-        rosecodes_exist = False
-        win32api.MessageBox(xw.Book.caller().app.hwnd,"Need to assign rosecode to ticker")
-        return
-    if rosecodes_exist and len(tickers) != len(rosecodes):
-        win32api.MessageBox(xw.Book.caller().app.hwnd, "Number of tickers words doesn't equal num rosecodes")
-        return
-    for i, ticker in enumerate(tickers):
-        upper = ticker.upper()
-        df = yf.download(upper, start="1970-01-01", end=datetime.datetime.today().strftime('%Y-%m-%d'))
-        yahoo_df = df[[field]]
-
-        errors = []
-        try:
-            metas_values = ['yahoo',ticker,field,'b']
-            metas_index = ['source','ticker','concept','frequency']
-            metas_df = pd.DataFrame(metas_values,index = metas_index)
-            rose.push(code=rosecodes[i], metas=metas_df, values=yahoo_df)
-        except Exception as e:
-            errors.append("Unknown Error Creating Dataset (" + rosecodes[i] + "): ")
-    return errors
-
-def push_trend_to_rose(args):
-    try:
-        from pytrends.request import TrendReq
-    except:
-        win32api.MessageBox(xw.Book.caller().app.hwnd,"pytrends package not installed, use 'pip install pytrends' to install Pytrends")
-        return
-    keyword_range = args[0]
-    kw_list_as_range = bool(int(args[1]))
-    rose_codes = args[2]
-    rose_codes_as_range = bool(int(args[3]))
-
-    kw_list = None
-    if kw_list_as_range:
-        kw_list = [str(cell.value) for cell in xw.Range(keyword_range)]
-    else:
-        kw_list = [code_range]
-
-    if rose_codes_as_range:
-        rose_codes = [str(cell.value) for cell in xw.Range(rose_codes)]
-    else:
-        rose_codes = [rose_codes]
-
-    errors = push_trend_to_rose_sub(kw_list, rose_codes)
-    if len(errors) > 0:
-        win32api.MessageBox(xw.Book.caller().app.hwnd, "Errors for the following codes:\n" + "\n".join(errors))
-    else:
-        win32api.MessageBox(xw.Book.caller().app.hwnd, "Success")
-
-def push_trend_to_rose_sub(kw_list, rose_codes=[]):
-    from pytrends.request import TrendReq
-    rose_codes_exist = True
-    if len(rose_codes) == 0 or (len(rose_codes) == 1 and rose_codes[0] == ""):
-        rose_codes_exist = False
-
-    if rose_codes_exist and len(kw_list) != len(rose_codes):
-        win32api.MessageBox(xw.Book.caller().app.hwnd, "Num key words doesn't equal num rose_codes")
-        return
-
-    rose_trend = Rose()
-    rose_trend.base_url = 'https://rose.ai'
-    rose_trend.login('googletrends-upload@snow.ventures', 'bbrUW7qZb83s5PK')
-
-    errors=[]
-    pytrends = TrendReq(hl='en-US',tz=360)
-    pytrends.build_payload(kw_list,cat=0,timeframe='all',geo='US',gprop='')
-    trend_data_values = pytrends.interest_over_time()
-    del trend_data_values['isPartial']
-
-    errors = []
-    for idx, column in enumerate(trend_data_values.columns):
-        code = column.replace(' ', '_') + ".googletrends"
-        try:
-            metas_values = ['Google Trends',column]
-            metas_index = ['source','Key word']
-            metas_df = pd.DataFrame(metas_values,index = metas_index)
-            rose_trend.push(code=code, metas=metas_df, values=trend_data_values[[column]])
-            if rose_codes_exist:
-                rose.push_logic(code=rose_codes[idx], logic=code)
-        except Exception as e:
-            errors.append("Unknown Error Creating Dataset (" + code + "): " + str(traceback.format_exc()) if debug == 1 else code)
 
     return errors
