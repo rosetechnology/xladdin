@@ -1,1 +1,1 @@
-{"rose.addin.xl.v2.xlam": "0.0.3", "addin2.py": "0.0.7"}
+{"rose.addin.xl.v2.xlam": "0.0.3", "addin2.py": "0.0.8"}
