@@ -482,8 +482,9 @@ def update(args):
     value_list = []
     if dataset.loc['type', 'value'] == 'map':
         for column in values_temp.columns:
-            for value in values_temp[column].values:
-                value_list.append(value)
+            if values_temp[column].dtype != np.int64 and values_temp[column].dtype != np.float64:
+                for value in values_temp[column].values:
+                    value_list.append(value)
 
         value_list = list(set(value_list))
 
